@@ -42,6 +42,10 @@ def train(
             model.load_state_dict(checkpoint)
             print("loaded model weights from", resume_path)
 
+    if getattr(model, "raap", None) is not None:
+        bank_count = model.build_raap_bank(train_loader)
+        print(f"RAAP retrieval bank built with {bank_count} items")
+
     def save_checkpoint(path, epoch_no):
         torch.save(
             {

@@ -58,10 +58,6 @@ def main(args):
     )
     model = CSDI_AQI36(config, args.device).to(args.device)
 
-    if model.raap is not None:
-        bank_count = model.build_raap_bank(train_loader)
-        print(f"RAAP retrieval bank built with {bank_count} items")
-
     if args.modelfolder == "":
         train(
             model,
@@ -79,6 +75,10 @@ def main(args):
                 map_location=args.device,
             )
         )
+
+    if model.raap is not None:
+        bank_count = model.build_raap_bank(train_loader)
+        print(f"RAAP retrieval bank refreshed with {bank_count} items")
 
     evaluate(
         model,
