@@ -12,11 +12,14 @@ def train(
     train_loader,
     valid_loader=None,
     foldername="",
+    resume_path=None,
 ):
     optimizer = Adam(model.parameters(), lr=config["lr"], weight_decay=1e-6)
     is_lr_decay = config["is_lr_decay"]
     if foldername != "":
         output_path = foldername + "/model.pth"
+        checkpoint_last_path = foldername + "/checkpoint_last.pth"
+        checkpoint_best_path = foldername + "/checkpoint_best.pth"
         logging.basicConfig(filename=foldername + '/train_model.log', level=logging.DEBUG)
     if is_lr_decay:
         p1 = int(0.75 * config["epochs"])
@@ -24,11 +27,45 @@ def train(
         lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=[p1, p2], gamma=0.1
         )
+    else:
+        lr_scheduler = None
 
     valid_epoch_interval = config["valid_epoch_interval"]
     best_valid_loss = 1e10
+    start_epoch = 0
 
-    for epoch_no in range(config["epochs"]):
+    if resume_path:
+        checkpoint = torch.load(resume_path, map_location=next(model.parameters()).device)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if lr_scheduler is not None and checkpoint.get("scheduler_state_dict") is not None:
+                lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            start_epoch = checkpoint.get("epoch", -1) + 1
+            best_valid_loss = checkpoint.get("best_valid_loss", best_valid_loss)
+            print("resumed training from", resume_path, "at epoch", start_epoch)
+        else:
+            model.load_state_dict(checkpoint)
+            print("loaded model weights from", resume_path)
+
+    if getattr(model, "raap", None) is not None:
+        bank_count = model.build_raap_bank(train_loader)
+        print(f"RAAP retrieval bank built with {bank_count} items")
+
+    def save_checkpoint(path, epoch_no):
+        torch.save(
+            {
+                "epoch": epoch_no,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+                "best_valid_loss": best_valid_loss,
+                "config": config,
+            },
+            path,
+        )
+
+    for epoch_no in range(start_epoch, config["epochs"]):
         avg_loss = 0
         model.train()
         with tqdm(train_loader, mininterval=5.0, maxinterval=50.0) as it:
@@ -75,6 +112,9 @@ def train(
                 logging.info("best loss is updated to "+str(avg_loss_valid / batch_no)+" at "+str(epoch_no))
                 if foldername != "":
                     torch.save(model.state_dict(), foldername + "/tmp_model"+str(epoch_no)+".pth")
+                    save_checkpoint(checkpoint_best_path, epoch_no)
+        if foldername != "":
+            save_checkpoint(checkpoint_last_path, epoch_no)
 
     if foldername != "":
         torch.save(model.state_dict(), output_path)

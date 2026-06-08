@@ -6,6 +6,7 @@ import yaml
 import os
 import logging
 import numpy as np
+import random
 
 from dataset_aqi36 import get_dataloader
 from main_model import PriSTI_aqi36
@@ -13,10 +14,15 @@ from utils import train, evaluate
 
 
 def main(args):
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        args.device = "cpu"
+
     SEED = args.seed
+    random.seed(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
-    torch.cuda.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
     path = "config/" + args.config
     with open(path, "r") as f:
@@ -26,12 +32,17 @@ def main(args):
     config["model"]["target_strategy"] = args.targetstrategy
     config["diffusion"]["adj_file"] = 'AQI36'
     config["seed"] = SEED
+    if args.epochs is not None:
+        config["train"]["epochs"] = args.epochs
+    if args.batch_size is not None:
+        config["train"]["batch_size"] = args.batch_size
 
     print(json.dumps(config, indent=4))
 
     current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder_prefix = "pm25_raap" if config.get("raap", {}).get("enabled", False) else "pm25_outsample"
     foldername = (
-        "./save/pm25_outsample_" + current_time + "/"
+        "./save/" + folder_prefix + "_" + current_time + "/"
     )
 
     print('model folder:', foldername)
@@ -53,9 +64,14 @@ def main(args):
             train_loader,
             valid_loader=valid_loader,
             foldername=foldername,
+            resume_path=args.resume,
         )
     else:
         model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth", map_location=args.device))
+
+    if model.raap is not None:
+        bank_count = model.build_raap_bank(train_loader)
+        print(f"RAAP retrieval bank refreshed with {bank_count} items")
 
     logging.basicConfig(filename=foldername + '/test_model.log', level=logging.DEBUG)
     logging.info("model_name={}".format(args.modelfolder))
@@ -69,9 +85,9 @@ def main(args):
     )
 
 
-if __name__ == '__main__':
+def build_parser():
     parser = argparse.ArgumentParser(description="PriSTI")
-    parser.add_argument("--config", type=str, default="base.yaml")
+    parser.add_argument("--config", type=str, default="base_raap.yaml")
     parser.add_argument('--device', default='cuda:0', help='Device for Attack')
     parser.add_argument('--num_workers', type=int, default=16, help='Device for Attack')
     parser.add_argument("--modelfolder", type=str, default="")
@@ -84,8 +100,14 @@ if __name__ == '__main__':
     parser.add_argument("--nsample", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--unconditional", action="store_true")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    return parser
 
-    args = parser.parse_args()
+
+if __name__ == '__main__':
+    args = build_parser().parse_args()
     print(args)
 
     main(args)

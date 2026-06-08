@@ -1,7 +1,14 @@
 import numpy as np
+import sys
 import torch
 import torch.nn as nn
+from pathlib import Path
 from diff_models import Guide_diff
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+from raap import RAAPModule
 
 
 class PriSTI(nn.Module):
@@ -16,6 +23,12 @@ class PriSTI(nn.Module):
         self.is_unconditional = config["model"]["is_unconditional"]
         self.target_strategy = config["model"]["target_strategy"]
         self.use_guide = config["model"]["use_guide"]
+        raap_config = config.get("raap", {})
+        self.raap = (
+            RAAPModule(raap_config, target_dim=target_dim)
+            if raap_config.get("enabled", False)
+            else None
+        )
 
         self.cde_output_channels = config["diffusion"]["channels"]
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
@@ -28,7 +41,12 @@ class PriSTI(nn.Module):
         config_diff["device"] = device
         self.device = device
 
-        input_dim = 2
+        if self.use_guide:
+            input_dim = 2 + (1 if self.raap is not None else 0)
+        else:
+            input_dim = 1 if self.is_unconditional else 2
+            if self.raap is not None:
+                input_dim += 1
         self.diffmodel = Guide_diff(config_diff, input_dim, target_dim, self.use_guide)
 
         # parameters for diffusion models
@@ -45,6 +63,78 @@ class PriSTI(nn.Module):
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)
         self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
+
+    def build_raap_bank(self, train_loader):
+        if self.raap is None:
+            return 0
+
+        was_training = self.training
+        self.eval()
+        values = []
+        masks = []
+        embeds = []
+        total = 0
+        max_items = self.raap.bank_size
+
+        with torch.no_grad():
+            for batch in train_loader:
+                processed = self.process_data(batch)
+                observed_data = processed[0]
+                observed_mask = processed[1]
+                remaining = max_items - total
+                if remaining <= 0:
+                    break
+                observed_data = observed_data[:remaining]
+                observed_mask = observed_mask[:remaining]
+                embed = self.raap.encode_global(observed_data, observed_mask)
+                values.append(observed_data.detach())
+                masks.append(observed_mask.detach())
+                embeds.append(embed.detach())
+                total += observed_data.shape[0]
+                if total >= max_items:
+                    break
+
+        if total > 0:
+            self.raap.retrieval_bank.set_bank(
+                torch.cat(values, dim=0),
+                torch.cat(masks, dim=0),
+                torch.cat(embeds, dim=0),
+            )
+        if was_training:
+            self.train()
+        return total
+
+    def compute_raap_prior(self, observed_data, cond_mask):
+        if self.raap is None:
+            return None
+        x_rag_prior = self.raap(observed_data, cond_mask)
+        if x_rag_prior.shape != observed_data.shape:
+            raise RuntimeError(
+                "RAAP prior shape must match observed_data: "
+                f"{tuple(x_rag_prior.shape)} != {tuple(observed_data.shape)}"
+            )
+        return x_rag_prior
+
+    def build_itp_info(self, coeffs, x_rag_prior=None):
+        if not self.use_guide:
+            return None
+
+        guide_inputs = []
+        if coeffs is not None:
+            guide_inputs.append(coeffs.unsqueeze(1))
+        elif x_rag_prior is not None:
+            guide_inputs.append(torch.zeros_like(x_rag_prior).unsqueeze(1))
+
+        if self.raap is not None:
+            if x_rag_prior is None:
+                if coeffs is None:
+                    raise ValueError("coeffs or x_rag_prior is required for RAAP guide input")
+                x_rag_prior = torch.zeros_like(coeffs)
+            guide_inputs.append(x_rag_prior.to(dtype=guide_inputs[0].dtype).unsqueeze(1))
+
+        if not guide_inputs:
+            return None
+        return torch.cat(guide_inputs, dim=1)
 
     def time_embedding(self, pos, d_model=128):
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
@@ -71,18 +161,33 @@ class PriSTI(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, itp_info, is_train
+        self, observed_data, cond_mask, observed_mask, side_info, itp_info, is_train, x_rag_prior=None
     ):
         loss_sum = 0
         for t in range(self.num_steps):  # calculate loss for all t
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, itp_info, is_train, set_t=t
+                observed_data,
+                cond_mask,
+                observed_mask,
+                side_info,
+                itp_info,
+                is_train,
+                set_t=t,
+                x_rag_prior=x_rag_prior,
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, itp_info, is_train, set_t=-1
+        self,
+        observed_data,
+        cond_mask,
+        observed_mask,
+        side_info,
+        itp_info,
+        is_train,
+        set_t=-1,
+        x_rag_prior=None,
     ):
         B, K, L = observed_data.shape
         if is_train != 1:  # for validation
@@ -92,7 +197,9 @@ class PriSTI(nn.Module):
         current_alpha = self.alpha_torch[t]  # (B,1,1)
         noise = torch.randn_like(observed_data)
         noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * noise
-        total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask)
+        total_input = self.set_input_to_diffmodel(
+            noisy_data, observed_data, cond_mask, x_rag_prior=x_rag_prior
+        )
         if not self.use_guide:
             itp_info = cond_mask * observed_data
         predicted = self.diffmodel(total_input, side_info, t, itp_info, cond_mask)
@@ -103,7 +210,7 @@ class PriSTI(nn.Module):
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         return loss
 
-    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
+    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask, x_rag_prior=None):
         if self.is_unconditional == True:
             total_input = noisy_data.unsqueeze(1)
         else:
@@ -113,9 +220,14 @@ class PriSTI(nn.Module):
                 total_input = torch.cat([cond_obs, noisy_target], dim=1)
             else:
                 total_input = ((1 - cond_mask) * noisy_data).unsqueeze(1)
+        if self.raap is not None and not self.use_guide:
+            if x_rag_prior is None:
+                x_rag_prior = torch.zeros_like(observed_data)
+            x_rag_prior = x_rag_prior.to(device=total_input.device, dtype=total_input.dtype)
+            total_input = torch.cat([total_input, x_rag_prior.unsqueeze(1)], dim=1)
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, itp_info):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, itp_info, x_rag_prior=None):
         B, K, L = observed_data.shape
 
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
@@ -143,6 +255,13 @@ class PriSTI(nn.Module):
                         diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
                     else:
                         diff_input = ((1 - cond_mask) * current_sample).unsqueeze(1)  # (B,1,K,L)
+                if self.raap is not None and not self.use_guide:
+                    if x_rag_prior is None:
+                        prior_input = torch.zeros_like(observed_data)
+                    else:
+                        prior_input = x_rag_prior
+                    prior_input = prior_input.to(device=diff_input.device, dtype=diff_input.dtype)
+                    diff_input = torch.cat([diff_input, prior_input.unsqueeze(1)], dim=1)
                 predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), itp_info, cond_mask)
 
                 coeff1 = 1 / self.alpha_hat[t] ** 0.5
@@ -171,13 +290,22 @@ class PriSTI(nn.Module):
             cond_mask,
         ) = self.process_data(batch)
 
+        x_rag_prior = self.compute_raap_prior(observed_data, cond_mask)
         side_info = self.get_side_info(observed_tp, cond_mask)
         itp_info = None
         if self.use_guide:
-            itp_info = coeffs.unsqueeze(1)
+            itp_info = self.build_itp_info(coeffs, x_rag_prior)
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
-        output = loss_func(observed_data, cond_mask, observed_mask, side_info, itp_info, is_train)
+        output = loss_func(
+            observed_data,
+            cond_mask,
+            observed_mask,
+            side_info,
+            itp_info,
+            is_train,
+            x_rag_prior=x_rag_prior,
+        )
         return output
 
     def evaluate(self, batch, n_samples):
@@ -196,12 +324,20 @@ class PriSTI(nn.Module):
             cond_mask = gt_mask
             target_mask = observed_mask - cond_mask
 
+            x_rag_prior = self.compute_raap_prior(observed_data, cond_mask)
             side_info = self.get_side_info(observed_tp, cond_mask)
             itp_info = None
             if self.use_guide:
-                itp_info = coeffs.unsqueeze(1)
+                itp_info = self.build_itp_info(coeffs, x_rag_prior)
 
-            samples = self.impute(observed_data, cond_mask, side_info, n_samples, itp_info)
+            samples = self.impute(
+                observed_data,
+                cond_mask,
+                side_info,
+                n_samples,
+                itp_info,
+                x_rag_prior=x_rag_prior,
+            )
 
             for i in range(len(cut_length)):  # to avoid double evaluation
                 target_mask[i, ..., 0 : cut_length[i].item()] = 0
@@ -319,4 +455,3 @@ class PriSTI_PemsBAY(PriSTI):
             coeffs,
             cond_mask,
         )
-
