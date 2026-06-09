@@ -27,12 +27,16 @@ model:
 
 raap:
   enabled: true
+  fusion: internal
   top_k: 5
   bank_size: 2048
+  bank_rebuild_epoch_interval: 5
   patch_size: 4
   d_model: 128
   n_heads: 4
   num_encoder_layers: 2
   num_decoder_layers: 1
   dropout: 0.1
+  fusion_dropout: 0.0
+  fusion_gate_init: -2.0
   use_batch_retrieval_fallback: true

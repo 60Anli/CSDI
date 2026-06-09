@@ -25,6 +25,21 @@ class CSDI_base(nn.Module):
             if raap_config.get("enabled", False)
             else None
         )
+        self.raap_fusion = raap_config.get("fusion", "input")
+        if self.raap is None:
+            self.raap_input_fusion = False
+            self.raap_internal_fusion = False
+        elif self.raap_fusion == "input":
+            self.raap_input_fusion = True
+            self.raap_internal_fusion = False
+        elif self.raap_fusion in ["internal", "rma", "reference"]:
+            self.raap_input_fusion = False
+            self.raap_internal_fusion = True
+        else:
+            raise ValueError(f"Unsupported raap.fusion: {self.raap_fusion}")
+        self.raap_bank_rebuild_epoch_interval = raap_config.get(
+            "bank_rebuild_epoch_interval", 0
+        )
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.graph_enabled:
@@ -43,9 +58,15 @@ class CSDI_base(nn.Module):
 
         config_diff = config["diffusion"]
         config_diff["side_dim"] = self.emb_total_dim
+        config_diff["raap_internal_fusion"] = self.raap_internal_fusion
+        config_diff["raap_top_k"] = raap_config.get("top_k", 5)
+        config_diff["raap_fusion_dropout"] = raap_config.get(
+            "fusion_dropout", raap_config.get("dropout", 0.0)
+        )
+        config_diff["raap_fusion_gate_init"] = raap_config.get("fusion_gate_init", -2.0)
 
         input_dim = 1 if self.is_unconditional == True else 2
-        if self.raap is not None:
+        if self.raap_input_fusion:
             input_dim += 1
         self.diffmodel = diff_CSDI(config_diff, input_dim)
 
@@ -104,15 +125,25 @@ class CSDI_base(nn.Module):
             self.train()
         return total
 
-    def compute_raap_prior(self, observed_data, cond_mask):
+    def compute_raap_context(self, observed_data, cond_mask):
         if self.raap is None:
-            return None
+            return None, None, None
+        if self.raap_internal_fusion:
+            _, _, reference_values, reference_masks = self.raap.retrieve_references(
+                observed_data, cond_mask
+            )
+            return None, reference_values, reference_masks
+
         x_rag_prior = self.raap(observed_data, cond_mask)
         if x_rag_prior.shape != observed_data.shape:
             raise RuntimeError(
                 "RAAP prior shape must match observed_data: "
                 f"{tuple(x_rag_prior.shape)} != {tuple(observed_data.shape)}"
             )
+        return x_rag_prior, None, None
+
+    def compute_raap_prior(self, observed_data, cond_mask):
+        x_rag_prior, _, _ = self.compute_raap_context(observed_data, cond_mask)
         return x_rag_prior
 
     def time_embedding(self, pos, d_model=128):
@@ -183,7 +214,15 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, x_rag_prior=None
+        self,
+        observed_data,
+        cond_mask,
+        observed_mask,
+        side_info,
+        is_train,
+        x_rag_prior=None,
+        raap_reference=None,
+        raap_reference_mask=None,
     ):
         loss_sum = 0
         for t in range(self.num_steps):  # calculate loss for all t
@@ -195,6 +234,8 @@ class CSDI_base(nn.Module):
                 is_train,
                 set_t=t,
                 x_rag_prior=x_rag_prior,
+                raap_reference=raap_reference,
+                raap_reference_mask=raap_reference_mask,
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
@@ -208,6 +249,8 @@ class CSDI_base(nn.Module):
         is_train,
         set_t=-1,
         x_rag_prior=None,
+        raap_reference=None,
+        raap_reference_mask=None,
     ):
         B, K, L = observed_data.shape
         if is_train != 1:  # for validation
@@ -222,7 +265,13 @@ class CSDI_base(nn.Module):
             noisy_data, observed_data, cond_mask, x_rag_prior
         )
 
-        predicted = self.diffmodel(total_input, side_info, t)  # (B,K,L)
+        predicted = self.diffmodel(
+            total_input,
+            side_info,
+            t,
+            raap_reference=raap_reference,
+            raap_reference_mask=raap_reference_mask,
+        )  # (B,K,L)
 
         target_mask = observed_mask - cond_mask
         residual = (noise - predicted) * target_mask
@@ -238,7 +287,7 @@ class CSDI_base(nn.Module):
             noisy_target = ((1 - cond_mask) * noisy_data).unsqueeze(1)
             total_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
 
-        if self.raap is not None:
+        if self.raap_input_fusion:
             if x_rag_prior is None:
                 x_rag_prior = torch.zeros_like(observed_data)
             x_rag_prior = x_rag_prior.to(device=total_input.device, dtype=total_input.dtype)
@@ -246,7 +295,16 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, x_rag_prior=None):
+    def impute(
+        self,
+        observed_data,
+        cond_mask,
+        side_info,
+        n_samples,
+        x_rag_prior=None,
+        raap_reference=None,
+        raap_reference_mask=None,
+    ):
         B, K, L = observed_data.shape
 
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
@@ -271,14 +329,20 @@ class CSDI_base(nn.Module):
                     cond_obs = (cond_mask * observed_data).unsqueeze(1)
                     noisy_target = ((1 - cond_mask) * current_sample).unsqueeze(1)
                     diff_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
-                if self.raap is not None:
+                if self.raap_input_fusion:
                     if x_rag_prior is None:
                         prior_input = torch.zeros_like(observed_data)
                     else:
                         prior_input = x_rag_prior
                     prior_input = prior_input.to(device=diff_input.device, dtype=diff_input.dtype)
                     diff_input = torch.cat([diff_input, prior_input.unsqueeze(1)], dim=1)
-                predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device))
+                predicted = self.diffmodel(
+                    diff_input,
+                    side_info,
+                    torch.tensor([t]).to(self.device),
+                    raap_reference=raap_reference,
+                    raap_reference_mask=raap_reference_mask,
+                )
 
                 coeff1 = 1 / self.alpha_hat[t] ** 0.5
                 coeff2 = (1 - self.alpha_hat[t]) / (1 - self.alpha[t]) ** 0.5
@@ -312,7 +376,9 @@ class CSDI_base(nn.Module):
         else:
             cond_mask = self.get_randmask(observed_mask)
 
-        x_rag_prior = self.compute_raap_prior(observed_data, cond_mask)
+        x_rag_prior, raap_reference, raap_reference_mask = self.compute_raap_context(
+            observed_data, cond_mask
+        )
         side_info = self.get_side_info(observed_tp, cond_mask, observed_data)
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
@@ -324,6 +390,8 @@ class CSDI_base(nn.Module):
             side_info,
             is_train,
             x_rag_prior=x_rag_prior,
+            raap_reference=raap_reference,
+            raap_reference_mask=raap_reference_mask,
         )
 
     def evaluate(self, batch, n_samples):
@@ -340,11 +408,19 @@ class CSDI_base(nn.Module):
             cond_mask = gt_mask
             target_mask = observed_mask - cond_mask
 
-            x_rag_prior = self.compute_raap_prior(observed_data, cond_mask)
+            x_rag_prior, raap_reference, raap_reference_mask = self.compute_raap_context(
+                observed_data, cond_mask
+            )
             side_info = self.get_side_info(observed_tp, cond_mask, observed_data)
 
             samples = self.impute(
-                observed_data, cond_mask, side_info, n_samples, x_rag_prior=x_rag_prior
+                observed_data,
+                cond_mask,
+                side_info,
+                n_samples,
+                x_rag_prior=x_rag_prior,
+                raap_reference=raap_reference,
+                raap_reference_mask=raap_reference_mask,
             )
 
             for i in range(len(cut_length)):  # to avoid double evaluation
@@ -519,7 +595,9 @@ class CSDI_Forecasting(CSDI_base):
                 observed_mask, gt_mask
             )
 
-        x_rag_prior = self.compute_raap_prior(observed_data, cond_mask)
+        x_rag_prior, raap_reference, raap_reference_mask = self.compute_raap_context(
+            observed_data, cond_mask
+        )
         side_info = self.get_side_info(observed_tp, cond_mask, feature_id, observed_data)
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
@@ -531,6 +609,8 @@ class CSDI_Forecasting(CSDI_base):
             side_info,
             is_train,
             x_rag_prior=x_rag_prior,
+            raap_reference=raap_reference,
+            raap_reference_mask=raap_reference_mask,
         )
 
 
@@ -550,11 +630,19 @@ class CSDI_Forecasting(CSDI_base):
             cond_mask = gt_mask
             target_mask = observed_mask * (1-gt_mask)
 
-            x_rag_prior = self.compute_raap_prior(observed_data, cond_mask)
+            x_rag_prior, raap_reference, raap_reference_mask = self.compute_raap_context(
+                observed_data, cond_mask
+            )
             side_info = self.get_side_info(observed_tp, cond_mask, observed_data=observed_data)
 
             samples = self.impute(
-                observed_data, cond_mask, side_info, n_samples, x_rag_prior=x_rag_prior
+                observed_data,
+                cond_mask,
+                side_info,
+                n_samples,
+                x_rag_prior=x_rag_prior,
+                raap_reference=raap_reference,
+                raap_reference_mask=raap_reference_mask,
             )
 
         return samples, observed_data, target_mask, observed_mask, observed_tp

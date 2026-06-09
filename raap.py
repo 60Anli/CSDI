@@ -226,7 +226,7 @@ class RAAPModule(nn.Module):
         _, global_embed = self.encoder(tokens)
         return global_embed
 
-    def forward(self, observed_data, cond_mask):
+    def retrieve_references(self, observed_data, cond_mask):
         dtype = observed_data.dtype
         cond_mask = cond_mask.to(dtype=dtype, device=observed_data.device)
 
@@ -241,6 +241,14 @@ class RAAPModule(nn.Module):
                 observed_data, cond_mask, query_global
             )
 
+        return query_tokens, meta, retrieved_values, retrieved_masks
+
+    def forward(self, observed_data, cond_mask, return_references=False):
+        dtype = observed_data.dtype
+        query_tokens, meta, retrieved_values, retrieved_masks = self.retrieve_references(
+            observed_data, cond_mask
+        )
+
         if retrieved_values is None:
             memory_tokens = query_tokens.new_zeros(query_tokens.shape)
         else:
@@ -249,7 +257,10 @@ class RAAPModule(nn.Module):
             )
 
         rag_tokens = self.cross_attention(query_tokens, memory_tokens)
-        return self.decoder(rag_tokens, meta).to(dtype=dtype)
+        prior = self.decoder(rag_tokens, meta).to(dtype=dtype)
+        if return_references:
+            return prior, retrieved_values, retrieved_masks
+        return prior
 
     def _encode_retrieved_segments(self, values, masks):
         B, top_k, K, L = values.shape

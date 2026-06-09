@@ -28,6 +28,82 @@ def Conv1d_with_init(in_channels, out_channels, kernel_size):
     return layer
 
 
+class ReferenceModulatedFusion(nn.Module):
+    def __init__(
+        self,
+        channels,
+        nheads,
+        top_k,
+        dropout=0.0,
+        gate_init=-2.0,
+    ):
+        super().__init__()
+        self.top_k = top_k
+        self.hidden_dim = 2 * channels
+        attn_heads = nheads if self.hidden_dim % nheads == 0 else math.gcd(self.hidden_dim, nheads)
+        attn_heads = max(attn_heads, 1)
+
+        self.ref_projection = nn.Conv2d(2 * top_k, self.hidden_dim, kernel_size=1)
+        nn.init.kaiming_normal_(self.ref_projection.weight)
+        self.query_norm = nn.LayerNorm(self.hidden_dim)
+        self.ref_norm = nn.LayerNorm(self.hidden_dim)
+        self.spatial_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim,
+            num_heads=attn_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.out_projection = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.gate_projection = nn.Conv2d(3 * self.hidden_dim, self.hidden_dim, kernel_size=1)
+        nn.init.zeros_(self.gate_projection.weight)
+        nn.init.constant_(self.gate_projection.bias, gate_init)
+
+    def forward(self, y, cond_info, base_shape, reference_values, reference_masks=None):
+        if reference_values is None:
+            return cond_info
+
+        B, _, K, L = base_shape
+        reference_values = reference_values.to(device=cond_info.device, dtype=cond_info.dtype)
+        if reference_masks is None:
+            reference_masks = torch.ones_like(reference_values)
+        else:
+            reference_masks = reference_masks.to(device=cond_info.device, dtype=cond_info.dtype)
+
+        reference_values = self._fit_top_k(reference_values, fill_value=0.0)
+        reference_masks = self._fit_top_k(reference_masks, fill_value=0.0)
+
+        ref_input = torch.cat([reference_values * reference_masks, reference_masks], dim=1)
+        ref_feat = self.ref_projection(ref_input)
+
+        y_feat = y.reshape(B, self.hidden_dim, K, L)
+        cond_feat = cond_info.reshape(B, self.hidden_dim, K, L)
+
+        query = (y_feat + cond_feat).permute(0, 3, 2, 1).reshape(B * L, K, self.hidden_dim)
+        ref = ref_feat.permute(0, 3, 2, 1).reshape(B * L, K, self.hidden_dim)
+        query = self.query_norm(query)
+        ref = self.ref_norm(ref)
+
+        attended, _ = self.spatial_attn(query, ref, ref, need_weights=False)
+        attended = self.out_projection(attended)
+        attended = attended.reshape(B, L, K, self.hidden_dim).permute(0, 3, 2, 1)
+
+        gate_input = torch.cat([y_feat, cond_feat, attended], dim=1)
+        gate = torch.sigmoid(self.gate_projection(gate_input))
+        fused = cond_feat + gate * attended
+        return fused.reshape(B, self.hidden_dim, K * L)
+
+    def _fit_top_k(self, x, fill_value):
+        if x.shape[1] == self.top_k:
+            return x
+        if x.shape[1] > self.top_k:
+            return x[:, : self.top_k]
+
+        pad_shape = list(x.shape)
+        pad_shape[1] = self.top_k - x.shape[1]
+        pad = x.new_full(pad_shape, fill_value)
+        return torch.cat([x, pad], dim=1)
+
+
 class DiffusionEmbedding(nn.Module):
     def __init__(self, num_steps, embedding_dim=128, projection_dim=None):
         super().__init__()
@@ -61,6 +137,7 @@ class diff_CSDI(nn.Module):
     def __init__(self, config, inputdim=2):
         super().__init__()
         self.channels = config["channels"]
+        self.raap_internal_fusion = config.get("raap_internal_fusion", False)
 
         self.diffusion_embedding = DiffusionEmbedding(
             num_steps=config["num_steps"],
@@ -80,12 +157,16 @@ class diff_CSDI(nn.Module):
                     diffusion_embedding_dim=config["diffusion_embedding_dim"],
                     nheads=config["nheads"],
                     is_linear=config["is_linear"],
+                    use_reference_fusion=self.raap_internal_fusion,
+                    raap_top_k=config.get("raap_top_k", 5),
+                    reference_dropout=config.get("raap_fusion_dropout", 0.0),
+                    reference_gate_init=config.get("raap_fusion_gate_init", -2.0),
                 )
                 for _ in range(config["layers"])
             ]
         )
 
-    def forward(self, x, cond_info, diffusion_step):
+    def forward(self, x, cond_info, diffusion_step, raap_reference=None, raap_reference_mask=None):
         B, inputdim, K, L = x.shape
 
         x = x.reshape(B, inputdim, K * L)
@@ -97,7 +178,13 @@ class diff_CSDI(nn.Module):
 
         skip = []
         for layer in self.residual_layers:
-            x, skip_connection = layer(x, cond_info, diffusion_emb)
+            x, skip_connection = layer(
+                x,
+                cond_info,
+                diffusion_emb,
+                raap_reference=raap_reference,
+                raap_reference_mask=raap_reference_mask,
+            )
             skip.append(skip_connection)
 
         x = torch.sum(torch.stack(skip), dim=0) / math.sqrt(len(self.residual_layers))
@@ -110,12 +197,34 @@ class diff_CSDI(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False):
+    def __init__(
+        self,
+        side_dim,
+        channels,
+        diffusion_embedding_dim,
+        nheads,
+        is_linear=False,
+        use_reference_fusion=False,
+        raap_top_k=5,
+        reference_dropout=0.0,
+        reference_gate_init=-2.0,
+    ):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         self.cond_projection = Conv1d_with_init(side_dim, 2 * channels, 1)
         self.mid_projection = Conv1d_with_init(channels, 2 * channels, 1)
         self.output_projection = Conv1d_with_init(channels, 2 * channels, 1)
+        self.reference_fusion = (
+            ReferenceModulatedFusion(
+                channels=channels,
+                nheads=nheads,
+                top_k=raap_top_k,
+                dropout=reference_dropout,
+                gate_init=reference_gate_init,
+            )
+            if use_reference_fusion
+            else None
+        )
 
         self.is_linear = is_linear
         if is_linear:
@@ -152,7 +261,7 @@ class ResidualBlock(nn.Module):
         y = y.reshape(B, L, channel, K).permute(0, 2, 3, 1).reshape(B, channel, K * L)
         return y
 
-    def forward(self, x, cond_info, diffusion_emb):
+    def forward(self, x, cond_info, diffusion_emb, raap_reference=None, raap_reference_mask=None):
         B, channel, K, L = x.shape
         base_shape = x.shape
         x = x.reshape(B, channel, K * L)
@@ -167,6 +276,14 @@ class ResidualBlock(nn.Module):
         _, cond_dim, _, _ = cond_info.shape
         cond_info = cond_info.reshape(B, cond_dim, K * L)
         cond_info = self.cond_projection(cond_info)  # (B,2*channel,K*L)
+        if self.reference_fusion is not None:
+            cond_info = self.reference_fusion(
+                y,
+                cond_info,
+                base_shape,
+                raap_reference,
+                raap_reference_mask,
+            )
         y = y + cond_info
 
         gate, filter = torch.chunk(y, 2, dim=1)

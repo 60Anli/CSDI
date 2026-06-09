@@ -6,7 +6,7 @@ from main_model import CSDI_AQI36
 from raap import RAAPModule
 
 
-def make_config(raap_enabled):
+def make_config(raap_enabled, fusion="internal"):
     return {
         "train": {
             "epochs": 1,
@@ -34,6 +34,7 @@ def make_config(raap_enabled):
         },
         "raap": {
             "enabled": raap_enabled,
+            "fusion": fusion,
             "top_k": 2,
             "bank_size": 8,
             "patch_size": 5,
@@ -42,6 +43,8 @@ def make_config(raap_enabled):
             "num_encoder_layers": 1,
             "num_decoder_layers": 1,
             "dropout": 0.0,
+            "fusion_dropout": 0.0,
+            "fusion_gate_init": -2.0,
             "use_batch_retrieval_fallback": True,
         },
     }
@@ -70,11 +73,14 @@ def test_raap_shape():
     observed_data = torch.randn(3, 36, 37)
     cond_mask = torch.randint(0, 2, (3, 36, 37)).float()
     x_rag_prior = raap(observed_data, cond_mask)
+    _, reference_values, reference_masks = raap(observed_data, cond_mask, return_references=True)
     assert x_rag_prior.shape == observed_data.shape
+    assert reference_values.shape == (3, 2, 36, 37)
+    assert reference_masks.shape == (3, 2, 36, 37)
 
 
-def test_csdi_forward_backward(raap_enabled):
-    config = make_config(raap_enabled)
+def test_csdi_forward_backward(raap_enabled, fusion="internal"):
+    config = make_config(raap_enabled, fusion=fusion)
     model = CSDI_AQI36(copy.deepcopy(config), "cpu")
     batch = make_batch()
     loss = model(batch, is_train=1)
@@ -85,5 +91,6 @@ def test_csdi_forward_backward(raap_enabled):
 if __name__ == "__main__":
     test_raap_shape()
     test_csdi_forward_backward(False)
-    test_csdi_forward_backward(True)
+    test_csdi_forward_backward(True, fusion="input")
+    test_csdi_forward_backward(True, fusion="internal")
     print("RAAP smoke tests passed")

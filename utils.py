@@ -45,6 +45,7 @@ def train(
     if getattr(model, "raap", None) is not None:
         bank_count = model.build_raap_bank(train_loader)
         print(f"RAAP retrieval bank built with {bank_count} items")
+    raap_bank_rebuild_interval = getattr(model, "raap_bank_rebuild_epoch_interval", 0)
 
     def save_checkpoint(path, epoch_no):
         torch.save(
@@ -60,6 +61,15 @@ def train(
         )
 
     for epoch_no in range(start_epoch, config["epochs"]):
+        if (
+            getattr(model, "raap", None) is not None
+            and raap_bank_rebuild_interval > 0
+            and epoch_no > start_epoch
+            and epoch_no % raap_bank_rebuild_interval == 0
+        ):
+            bank_count = model.build_raap_bank(train_loader)
+            print(f"RAAP retrieval bank rebuilt with {bank_count} items at epoch {epoch_no}")
+
         avg_loss = 0
         model.train()
         with tqdm(train_loader, mininterval=5.0, maxinterval=50.0) as it:
