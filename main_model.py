@@ -146,6 +146,18 @@ class CSDI_base(nn.Module):
         x_rag_prior, _, _ = self.compute_raap_context(observed_data, cond_mask)
         return x_rag_prior
 
+    def compute_raap_diagnostic_prior(self, observed_data, cond_mask, x_rag_prior=None):
+        if self.raap is None:
+            return None
+        if x_rag_prior is None:
+            x_rag_prior = self.raap(observed_data, cond_mask)
+        if x_rag_prior.shape != observed_data.shape:
+            raise RuntimeError(
+                "RAAP diagnostic prior shape must match observed_data: "
+                f"{tuple(x_rag_prior.shape)} != {tuple(observed_data.shape)}"
+            )
+        return x_rag_prior
+
     def time_embedding(self, pos, d_model=128):
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
         position = pos.unsqueeze(2)
@@ -425,7 +437,10 @@ class CSDI_base(nn.Module):
 
             for i in range(len(cut_length)):  # to avoid double evaluation
                 target_mask[i, ..., 0 : cut_length[i].item()] = 0
-        return samples, observed_data, target_mask, observed_mask, observed_tp
+            x_rag_prior = self.compute_raap_diagnostic_prior(
+                observed_data, cond_mask, x_rag_prior=x_rag_prior
+            )
+        return samples, observed_data, target_mask, observed_mask, observed_tp, x_rag_prior
 
 
 class CSDI_PM25(CSDI_base):
@@ -645,4 +660,8 @@ class CSDI_Forecasting(CSDI_base):
                 raap_reference_mask=raap_reference_mask,
             )
 
-        return samples, observed_data, target_mask, observed_mask, observed_tp
+            x_rag_prior = self.compute_raap_diagnostic_prior(
+                observed_data, cond_mask, x_rag_prior=x_rag_prior
+            )
+
+        return samples, observed_data, target_mask, observed_mask, observed_tp, x_rag_prior

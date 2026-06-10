@@ -180,15 +180,25 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
         all_observed_time = []
         all_evalpoint = []
         all_generated_samples = []
+        prior_mse_total = 0
+        prior_mae_total = 0
+        prior_evalpoints_total = 0
+        has_raap_prior = False
         with tqdm(test_loader, mininterval=5.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
                 output = model.evaluate(test_batch, nsample)
 
-                samples, c_target, eval_points, observed_points, observed_time = output
+                if len(output) == 6:
+                    samples, c_target, eval_points, observed_points, observed_time, raap_prior = output
+                else:
+                    samples, c_target, eval_points, observed_points, observed_time = output
+                    raap_prior = None
                 samples = samples.permute(0, 1, 3, 2)  # (B,nsample,L,K)
                 c_target = c_target.permute(0, 2, 1)  # (B,L,K)
                 eval_points = eval_points.permute(0, 2, 1)
                 observed_points = observed_points.permute(0, 2, 1)
+                if raap_prior is not None:
+                    raap_prior = raap_prior.permute(0, 2, 1)
 
                 samples_median = samples.median(dim=1)
                 all_target.append(c_target)
@@ -208,14 +218,25 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 mae_total += mae_current.sum().item()
                 evalpoints_total += eval_points.sum().item()
 
-                it.set_postfix(
-                    ordered_dict={
-                        "rmse_total": np.sqrt(mse_total / evalpoints_total),
-                        "mae_total": mae_total / evalpoints_total,
-                        "batch_no": batch_no,
-                    },
-                    refresh=True,
-                )
+                postfix = {
+                    "rmse_total": np.sqrt(mse_total / evalpoints_total),
+                    "mae_total": mae_total / evalpoints_total,
+                    "batch_no": batch_no,
+                }
+                if raap_prior is not None:
+                    has_raap_prior = True
+                    prior_mse_current = (
+                        ((raap_prior - c_target) * eval_points) ** 2
+                    ) * (scaler ** 2)
+                    prior_mae_current = (
+                        torch.abs((raap_prior - c_target) * eval_points)
+                    ) * scaler
+                    prior_mse_total += prior_mse_current.sum().item()
+                    prior_mae_total += prior_mae_current.sum().item()
+                    prior_evalpoints_total += eval_points.sum().item()
+                    postfix["raap_prior_mae"] = prior_mae_total / prior_evalpoints_total
+
+                it.set_postfix(ordered_dict=postfix, refresh=True)
 
             with open(
                 foldername + "/generated_outputs_nsample" + str(nsample) + ".pk", "wb"
@@ -261,3 +282,14 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                 print("MAE:", mae_total / evalpoints_total)
                 print("CRPS:", CRPS)
                 print("CRPS_sum:", CRPS_sum)
+
+            if has_raap_prior:
+                prior_rmse = np.sqrt(prior_mse_total / prior_evalpoints_total)
+                prior_mae = prior_mae_total / prior_evalpoints_total
+                with open(
+                    foldername + "/raap_prior_result_nsample" + str(nsample) + ".pk",
+                    "wb",
+                ) as f:
+                    pickle.dump([prior_rmse, prior_mae], f)
+                print("RAAP_prior_RMSE:", prior_rmse)
+                print("RAAP_prior_MAE:", prior_mae)
