@@ -158,6 +158,21 @@ class CSDI_base(nn.Module):
             )
         return x_rag_prior
 
+    def compute_raap_diagnostic_references(
+        self,
+        observed_data,
+        cond_mask,
+        raap_reference=None,
+        raap_reference_mask=None,
+    ):
+        if self.raap is None:
+            return None, None
+        if raap_reference is None:
+            _, _, raap_reference, raap_reference_mask = self.raap.retrieve_references(
+                observed_data, cond_mask
+            )
+        return raap_reference, raap_reference_mask
+
     def time_embedding(self, pos, d_model=128):
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
         position = pos.unsqueeze(2)
@@ -440,7 +455,22 @@ class CSDI_base(nn.Module):
             x_rag_prior = self.compute_raap_diagnostic_prior(
                 observed_data, cond_mask, x_rag_prior=x_rag_prior
             )
-        return samples, observed_data, target_mask, observed_mask, observed_tp, x_rag_prior
+            raap_reference, raap_reference_mask = self.compute_raap_diagnostic_references(
+                observed_data,
+                cond_mask,
+                raap_reference=raap_reference,
+                raap_reference_mask=raap_reference_mask,
+            )
+        return (
+            samples,
+            observed_data,
+            target_mask,
+            observed_mask,
+            observed_tp,
+            x_rag_prior,
+            raap_reference,
+            raap_reference_mask,
+        )
 
 
 class CSDI_PM25(CSDI_base):
@@ -663,5 +693,20 @@ class CSDI_Forecasting(CSDI_base):
             x_rag_prior = self.compute_raap_diagnostic_prior(
                 observed_data, cond_mask, x_rag_prior=x_rag_prior
             )
+            raap_reference, raap_reference_mask = self.compute_raap_diagnostic_references(
+                observed_data,
+                cond_mask,
+                raap_reference=raap_reference,
+                raap_reference_mask=raap_reference_mask,
+            )
 
-        return samples, observed_data, target_mask, observed_mask, observed_tp, x_rag_prior
+        return (
+            samples,
+            observed_data,
+            target_mask,
+            observed_mask,
+            observed_tp,
+            x_rag_prior,
+            raap_reference,
+            raap_reference_mask,
+        )

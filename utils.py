@@ -184,21 +184,46 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
         prior_mae_total = 0
         prior_evalpoints_total = 0
         has_raap_prior = False
+        ref_mean_mse_total = 0
+        ref_mean_mae_total = 0
+        ref_best_mse_total = 0
+        ref_best_mae_total = 0
+        ref_evalpoints_total = 0
+        has_raap_reference = False
         with tqdm(test_loader, mininterval=5.0, maxinterval=50.0) as it:
             for batch_no, test_batch in enumerate(it, start=1):
                 output = model.evaluate(test_batch, nsample)
 
-                if len(output) == 6:
+                if len(output) == 8:
+                    (
+                        samples,
+                        c_target,
+                        eval_points,
+                        observed_points,
+                        observed_time,
+                        raap_prior,
+                        raap_reference,
+                        raap_reference_mask,
+                    ) = output
+                elif len(output) == 6:
                     samples, c_target, eval_points, observed_points, observed_time, raap_prior = output
+                    raap_reference = None
+                    raap_reference_mask = None
                 else:
                     samples, c_target, eval_points, observed_points, observed_time = output
                     raap_prior = None
+                    raap_reference = None
+                    raap_reference_mask = None
                 samples = samples.permute(0, 1, 3, 2)  # (B,nsample,L,K)
                 c_target = c_target.permute(0, 2, 1)  # (B,L,K)
                 eval_points = eval_points.permute(0, 2, 1)
                 observed_points = observed_points.permute(0, 2, 1)
                 if raap_prior is not None:
                     raap_prior = raap_prior.permute(0, 2, 1)
+                if raap_reference is not None:
+                    raap_reference = raap_reference.permute(0, 1, 3, 2)
+                    if raap_reference_mask is not None:
+                        raap_reference_mask = raap_reference_mask.permute(0, 1, 3, 2)
 
                 samples_median = samples.median(dim=1)
                 all_target.append(c_target)
@@ -235,6 +260,48 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     prior_mae_total += prior_mae_current.sum().item()
                     prior_evalpoints_total += eval_points.sum().item()
                     postfix["raap_prior_mae"] = prior_mae_total / prior_evalpoints_total
+
+                if raap_reference is not None:
+                    has_raap_reference = True
+                    if raap_reference_mask is None:
+                        raap_reference_mask = torch.ones_like(raap_reference)
+
+                    ref_weight = raap_reference_mask.to(dtype=raap_reference.dtype)
+                    ref_denom = ref_weight.sum(dim=1).clamp(min=1.0)
+                    ref_mean = (raap_reference * ref_weight).sum(dim=1) / ref_denom
+
+                    ref_mean_mse_current = (
+                        ((ref_mean - c_target) * eval_points) ** 2
+                    ) * (scaler ** 2)
+                    ref_mean_mae_current = (
+                        torch.abs((ref_mean - c_target) * eval_points)
+                    ) * scaler
+
+                    ref_eval_points = eval_points.unsqueeze(1)
+                    ref_filled = torch.where(
+                        ref_weight > 0,
+                        raap_reference,
+                        ref_mean.unsqueeze(1),
+                    )
+                    ref_abs_error = (
+                        torch.abs((ref_filled - c_target.unsqueeze(1)) * ref_eval_points)
+                    ) * scaler
+                    ref_sq_error = (
+                        ((ref_filled - c_target.unsqueeze(1)) * ref_eval_points) ** 2
+                    ) * (scaler ** 2)
+                    ref_abs_by_item = ref_abs_error.sum(dim=(2, 3))
+                    best_idx = ref_abs_by_item.argmin(dim=1)
+                    batch_idx = torch.arange(ref_filled.shape[0], device=ref_filled.device)
+                    ref_best_abs_error = ref_abs_error[batch_idx, best_idx]
+                    ref_best_sq_error = ref_sq_error[batch_idx, best_idx]
+
+                    ref_mean_mse_total += ref_mean_mse_current.sum().item()
+                    ref_mean_mae_total += ref_mean_mae_current.sum().item()
+                    ref_best_mse_total += ref_best_sq_error.sum().item()
+                    ref_best_mae_total += ref_best_abs_error.sum().item()
+                    ref_evalpoints_total += eval_points.sum().item()
+                    postfix["raap_ref_mean_mae"] = ref_mean_mae_total / ref_evalpoints_total
+                    postfix["raap_ref_best_mae"] = ref_best_mae_total / ref_evalpoints_total
 
                 it.set_postfix(ordered_dict=postfix, refresh=True)
 
@@ -293,3 +360,21 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     pickle.dump([prior_rmse, prior_mae], f)
                 print("RAAP_prior_RMSE:", prior_rmse)
                 print("RAAP_prior_MAE:", prior_mae)
+
+            if has_raap_reference:
+                ref_mean_rmse = np.sqrt(ref_mean_mse_total / ref_evalpoints_total)
+                ref_mean_mae = ref_mean_mae_total / ref_evalpoints_total
+                ref_best_rmse = np.sqrt(ref_best_mse_total / ref_evalpoints_total)
+                ref_best_mae = ref_best_mae_total / ref_evalpoints_total
+                with open(
+                    foldername + "/raap_reference_result_nsample" + str(nsample) + ".pk",
+                    "wb",
+                ) as f:
+                    pickle.dump(
+                        [ref_mean_rmse, ref_mean_mae, ref_best_rmse, ref_best_mae],
+                        f,
+                    )
+                print("RAAP_ref_mean_RMSE:", ref_mean_rmse)
+                print("RAAP_ref_mean_MAE:", ref_mean_mae)
+                print("RAAP_ref_best_RMSE:", ref_best_rmse)
+                print("RAAP_ref_best_MAE:", ref_best_mae)
