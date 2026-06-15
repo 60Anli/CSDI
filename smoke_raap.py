@@ -43,6 +43,11 @@ def make_config(raap_enabled, fusion="internal"):
             "num_encoder_layers": 1,
             "num_decoder_layers": 1,
             "dropout": 0.0,
+            "retrieval_value_weight": 1.0,
+            "retrieval_mask_weight": 0.1,
+            "retrieval_distance": "rmse",
+            "retrieval_score_chunk_size": 4,
+            "retrieval_no_overlap_penalty": 3.0,
             "fusion_dropout": 0.0,
             "fusion_gate_init": -2.0,
             "use_batch_retrieval_fallback": True,
@@ -74,6 +79,18 @@ def test_raap_shape():
     cond_mask = torch.randint(0, 2, (3, 36, 37)).float()
     x_rag_prior = raap(observed_data, cond_mask)
     _, reference_values, reference_masks = raap(observed_data, cond_mask, return_references=True)
+    assert x_rag_prior.shape == observed_data.shape
+    assert reference_values.shape == (3, 2, 36, 37)
+    assert reference_masks.shape == (3, 2, 36, 37)
+
+    bank_values = torch.randn(4, 36, 37)
+    bank_masks = torch.randint(0, 2, (4, 36, 37)).float()
+    with torch.no_grad():
+        bank_embeds = raap.encode_global(bank_values, bank_masks)
+    raap.retrieval_bank.set_bank(bank_values, bank_masks, bank_embeds)
+    x_rag_prior, reference_values, reference_masks = raap(
+        observed_data, cond_mask, return_references=True
+    )
     assert x_rag_prior.shape == observed_data.shape
     assert reference_values.shape == (3, 2, 36, 37)
     assert reference_masks.shape == (3, 2, 36, 37)

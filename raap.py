@@ -77,10 +77,24 @@ class AttentionEncoder(nn.Module):
 
 
 class RetrievalBank(nn.Module):
-    def __init__(self, top_k=5, bank_size=2048):
+    def __init__(
+        self,
+        top_k=5,
+        bank_size=2048,
+        value_weight=0.0,
+        mask_weight=0.0,
+        distance="rmse",
+        score_chunk_size=512,
+        no_overlap_penalty=3.0,
+    ):
         super().__init__()
         self.top_k = top_k
         self.bank_size = bank_size
+        self.value_weight = value_weight
+        self.mask_weight = mask_weight
+        self.distance = distance
+        self.score_chunk_size = score_chunk_size
+        self.no_overlap_penalty = no_overlap_penalty
         self.register_buffer("values", torch.empty(0), persistent=False)
         self.register_buffer("masks", torch.empty(0), persistent=False)
         self.register_buffer("embeds", torch.empty(0), persistent=False)
@@ -95,7 +109,7 @@ class RetrievalBank(nn.Module):
         self.masks = masks[:size].detach()
         self.embeds = F.normalize(embeds[:size].detach(), dim=-1)
 
-    def retrieve(self, query_embed, dtype):
+    def retrieve(self, query_embed, dtype, query_values=None, query_masks=None):
         if not self.is_ready:
             return None, None
 
@@ -105,6 +119,14 @@ class RetrievalBank(nn.Module):
 
         query_embed = F.normalize(query_embed, dim=-1)
         sim = torch.matmul(query_embed, bank_embed.transpose(0, 1))
+        if self._uses_value_aware_score and query_values is not None and query_masks is not None:
+            sim = self._apply_value_aware_score(
+                sim,
+                query_values.to(device=query_embed.device, dtype=dtype),
+                query_masks.to(device=query_embed.device, dtype=dtype),
+                bank_values,
+                bank_masks,
+            )
         k_eff = min(self.top_k, bank_embed.shape[0])
         top_idx = sim.topk(k_eff, dim=-1).indices
 
@@ -115,6 +137,59 @@ class RetrievalBank(nn.Module):
                 retrieved_values, retrieved_masks, self.top_k - k_eff
             )
         return retrieved_values, retrieved_masks
+
+    @property
+    def _uses_value_aware_score(self):
+        return self.value_weight > 0 or self.mask_weight > 0
+
+    def _apply_value_aware_score(
+        self,
+        embed_score,
+        query_values,
+        query_masks,
+        bank_values,
+        bank_masks,
+    ):
+        chunks = []
+        chunk_size = max(int(self.score_chunk_size), 1)
+        for start in range(0, bank_values.shape[0], chunk_size):
+            end = min(start + chunk_size, bank_values.shape[0])
+            score = embed_score[:, start:end]
+            bank_value_chunk = bank_values[start:end]
+            bank_mask_chunk = bank_masks[start:end]
+
+            if self.value_weight > 0:
+                common_mask = query_masks.unsqueeze(1) * bank_mask_chunk.unsqueeze(0)
+                overlap = common_mask.sum(dim=(2, 3))
+                if self.distance == "mae":
+                    value_distance = (
+                        (query_values.unsqueeze(1) - bank_value_chunk.unsqueeze(0)).abs()
+                        * common_mask
+                    ).sum(dim=(2, 3)) / overlap.clamp(min=1.0)
+                else:
+                    value_distance = torch.sqrt(
+                        (
+                            (query_values.unsqueeze(1) - bank_value_chunk.unsqueeze(0)) ** 2
+                            * common_mask
+                        ).sum(dim=(2, 3))
+                        / overlap.clamp(min=1.0)
+                    )
+                value_distance = torch.where(
+                    overlap > 0,
+                    value_distance,
+                    value_distance.new_full(value_distance.shape, self.no_overlap_penalty),
+                )
+                score = score - self.value_weight * value_distance
+
+            if self.mask_weight > 0:
+                mask_mismatch = (
+                    query_masks.unsqueeze(1) - bank_mask_chunk.unsqueeze(0)
+                ).abs().mean(dim=(2, 3))
+                score = score - self.mask_weight * mask_mismatch
+
+            chunks.append(score)
+
+        return torch.cat(chunks, dim=1)
 
     @staticmethod
     def _pad_retrieval(values, masks, pad_count):
@@ -209,7 +284,15 @@ class RAAPModule(nn.Module):
             num_layers=config.get("num_encoder_layers", 2),
             dropout=dropout,
         )
-        self.retrieval_bank = RetrievalBank(top_k=self.top_k, bank_size=self.bank_size)
+        self.retrieval_bank = RetrievalBank(
+            top_k=self.top_k,
+            bank_size=self.bank_size,
+            value_weight=config.get("retrieval_value_weight", 0.0),
+            mask_weight=config.get("retrieval_mask_weight", 0.0),
+            distance=config.get("retrieval_distance", "rmse"),
+            score_chunk_size=config.get("retrieval_score_chunk_size", 512),
+            no_overlap_penalty=config.get("retrieval_no_overlap_penalty", 3.0),
+        )
         self.cross_attention = RetrievalCrossAttention(
             d_model=self.d_model, n_heads=self.n_heads, dropout=dropout
         )
@@ -234,7 +317,10 @@ class RAAPModule(nn.Module):
         query_tokens, query_global = self.encoder(query_tokens)
 
         retrieved_values, retrieved_masks = self.retrieval_bank.retrieve(
-            query_global, dtype=dtype
+            query_global,
+            dtype=dtype,
+            query_values=observed_data,
+            query_masks=cond_mask,
         )
         if retrieved_values is None and self.use_batch_retrieval_fallback:
             retrieved_values, retrieved_masks = self._batch_retrieval(

@@ -36,6 +36,11 @@ raap:
   num_encoder_layers: 2
   num_decoder_layers: 1
   dropout: 0.1
+  retrieval_value_weight: 1.0
+  retrieval_mask_weight: 0.1
+  retrieval_distance: "rmse"
+  retrieval_score_chunk_size: 512
+  retrieval_no_overlap_penalty: 3.0
   fusion_dropout: 0.0
   fusion_gate_init: -2.0
   use_batch_retrieval_fallback: true
